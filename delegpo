@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# delegpo — delegate ports to your projects.
+# Register a project (id + port + command), launch it by id, and see which
+# projects / ports are live right now. Compatible with macOS' bash 3.2.
+
+set -o pipefail
+
+VERSION="0.1.0"
+DELEGPO_HOME="${DELEGPO_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/delegpo}"
+DB="$DELEGPO_HOME/projects.tsv"     # id <TAB> port <TAB> dir <TAB> command
+LOG_DIR="$DELEGPO_HOME/logs"
+RUN_SHELL="${DELEGPO_SHELL:-${SHELL:-/bin/bash}}"
+RESERVED=" add register new edit rm remove del ls list info show status ps stop kill logs help version run "
+
+# ── styling ──────────────────────────────────────────────────────────────────
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  B=$'\033[1m' D=$'\033[2m' R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' C=$'\033[36m' M=$'\033[35m' N=$'\033[0m'
+else
+  B= D= R= G= Y= C= M= N=
+fi
+
+ok()   { printf '%s\n' "${G}✓${N} $*"; }
+info() { printf '%s\n' "${C}›${N} $*"; }
+warn() { printf '%s\n' "${Y}!${N} $*" >&2; }
+die()  { printf '%s\n' "${R}✗${N} $*" >&2; exit 1; }
+
+title() { printf '\n %s%s%s %s%s%s\n\n' "$B$M" "delegpo" "$N" "$D" "· $*" "$N"; }
+section() { printf ' %s%s%s\n' "$B" "$*" "$N"; }
+kv() { printf '   %s%-8s%s %s\n' "$D" "$1" "$N" "$2"; }
+
+rule() { local i s=""; for ((i = 0; i < $1; i++)); do s+="─"; done; printf '%s' "$s"; }
+
+tilde() { if [[ $1 == "$HOME"* ]]; then printf '~%s' "${1#"$HOME"}"; else printf '%s' "$1"; fi; }
+
+trunc() { # trunc STRING WIDTH  (ASCII ellipsis keeps printf padding aligned)
+  local s=$1 w=$2
+  if ((${#s} > w)); then
+    if ((w > 3)); then printf '%s...' "${s:0:w-3}"; else printf '%s' "${s:0:w}"; fi
+  else printf '%s' "$s"; fi
+}
+
+term_cols() { local c; c=$(tput cols 2>/dev/null) || c=100; [[ $c =~ ^[0-9]+$ ]] || c=100; echo "$c"; }
+
+ask() { # ask VAR "Label" [default]
+  local __var=$1 label=$2 def=$3 ans
+  if [[ -n $def ]]; then printf '   %s%s%s %s[%s]%s: ' "$B" "$label" "$N" "$D" "$def" "$N"
+  else printf '   %s%s%s: ' "$B" "$label" "$N"; fi
+  IFS= read -e -r ans || ans=
+  [[ -z $ans ]] && ans=$def
+  printf -v "$__var" '%s' "$ans"
+}
+
+confirm() { # confirm "Question"  → default No
+  local ans
+  [[ -t 0 ]] || return 1
+  printf '%s %s %s[y/N]%s ' "${Y}?${N}" "$1" "$D" "$N"
+  IFS= read -r ans || return 1
+  [[ $ans == [yY] || $ans == [yY][eE][sS] ]]
+}
+
+# ── storage ──────────────────────────────────────────────────────────────────
+ensure_db() { mkdir -p "$DELEGPO_HOME" "$LOG_DIR" && touch "$DB" || die "Cannot write to $DELEGPO_HOME"; }
+
+# load ID → sets P_ID P_PORT P_DIR P_CMD; returns 1 if missing
+load() {
+  local line
+  line=$(awk -F'\t' -v id="$1" '$1 == id { print; exit }' "$DB")
+  [[ -n $line ]] || return 1
+  IFS=$'\t' read -r P_ID P_PORT P_DIR P_CMD <<<"$line"
+}
+
+save() { # save ID PORT DIR CMD (replaces existing entry with same id)
+  local tmp="$DB.tmp.$$"
+  { awk -F'\t' -v id="$1" '$1 != id' "$DB"; printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; } >"$tmp" && mv "$tmp" "$DB"
+}
+
+delete() { local tmp="$DB.tmp.$$"; awk -F'\t' -v id="$1" '$1 != id' "$DB" >"$tmp" && mv "$tmp" "$DB"; }
+
+port_owner() { # port_owner PORT → id of the registered project using it (excluding $2)
+  awk -F'\t' -v p="$1" -v skip="$2" '$2 == p && $1 != skip { print $1; exit }' "$DB"
+}
+
+require_project() {
+  [[ -n $1 ]] || die "Missing project id. See ${B}delegpo help${N}"
+  load "$1" || die "No project named ${B}$1${N}. Run ${B}delegpo ls${N} to see registered projects."
+}
+
+# ── validation ───────────────────────────────────────────────────────────────
+valid_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { warn "ID must be letters, digits, '.', '_' or '-'"; return 1; }
+  [[ $RESERVED != *" $1 "* ]] || { warn "'$1' is a reserved command name"; return 1; }
+}
+valid_port() { [[ $1 =~ ^[0-9]+$ ]] && (($1 >= 1 && $1 <= 65535)) || { warn "Port must be a number between 1 and 65535"; return 1; }; }
+valid_cmd() {
+  [[ -n $1 ]] || { warn "Command cannot be empty"; return 1; }
+  [[ $1 != *$'\t'* && $1 != *$'\n'* ]] || { warn "Command cannot contain tabs or newlines"; return 1; }
+}
+
+# ── live port inspection ─────────────────────────────────────────────────────
+# Prints "port pid process" for every TCP listener, deduplicated, sorted by port.
+listening() {
+  lsof +c 0 -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk '
+    NR > 1 {
+      n = $9; sub(/.*:/, "", n); key = n " " $2
+      if (!(key in seen)) { seen[key] = 1; gsub(/\\x20/, "_", $1); print n, $2, $1 }
+    }' | sort -n -k1,1 -k2,2
+}
+
+# listeners_on PORT [LISTEN_CACHE] → "pid process" lines
+listeners_on() {
+  local data=${2-$(listening)}
+  awk -v p="$1" '$1 == p { print $2, $3 }' <<<"$data"
+}
+
+describe_listeners() { # "node (pid 123), python (pid 456)"
+  awk '{ printf "%s%s (pid %s)", (NR > 1 ? ", " : ""), $2, $1 }' <<<"$1"
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+cmd_help() {
+  cat <<EOF
+
+ ${B}${M}delegpo${N} ${D}v$VERSION · delegate ports to your projects${N}
+
+ ${B}USAGE${N}
+   ${C}delegpo${N} <id> [-d]                   Run a project's command  ${D}(-d: detach, log to file)${N}
+   ${C}delegpo add${N} [id] [port] [command]   Register a project  ${D}(prompts for anything missing)${N}
+   ${C}delegpo edit${N} <id>                   Edit a project interactively
+   ${C}delegpo rm${N} <id>                     Remove a project
+   ${C}delegpo ls${N}                          List projects with live status
+   ${C}delegpo info${N} <id>                   Show one project in detail
+   ${C}delegpo status${N}                      Active projects + every occupied port
+   ${C}delegpo stop${N} <id> [-f]              Stop whatever listens on the project's port
+   ${C}delegpo logs${N} <id>                   Follow the log of a detached run
+   ${C}delegpo help${N} | ${C}version${N}
+
+ ${B}ADD OPTIONS${N}
+   -d, --dir DIR     Working directory  ${D}(default: current directory)${N}
+   -f, --force       Overwrite existing id / duplicate port without asking
+
+ ${B}NOTES${N}
+   The command runs inside DIR via ${B}\$DELEGPO_SHELL${N} ${D}(default: \$SHELL)${N},
+   with ${B}\$PORT${N} and ${B}\$DELEGPO_ID${N} exported.
+   Data lives in ${B}$(tilde "$DB")${N} ${D}(override with \$DELEGPO_HOME)${N}.
+
+ ${B}EXAMPLES${N}
+   ${D}\$${N} delegpo add api 3000 npm run dev
+   ${D}\$${N} delegpo add web 5173 --dir ~/code/web -- pnpm dev --port 5173
+   ${D}\$${N} delegpo api
+   ${D}\$${N} delegpo status
+
+EOF
+}
+
+cmd_add() {
+  local id="" port="" dir="" cmd="" force=0 pos=()
+  while (($#)); do
+    if ((${#pos[@]} >= 2)) && [[ $1 != -* ]]; then pos+=("$@"); break; fi
+    case $1 in
+      -d | --dir) [[ -n $2 ]] || die "--dir needs a value"; dir=$2; shift 2 ;;
+      -f | --force) force=1; shift ;;
+      --) shift; pos+=("$@"); break ;;
+      -*) die "Unknown option: $1" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  id=${pos[0]-}; port=${pos[1]-}; cmd="${pos[*]:2}"
+
+  local interactive=0
+  if [[ -z $id || -z $port || -z $cmd ]]; then
+    [[ -t 0 ]] || die "Usage: delegpo add <id> <port> [--dir DIR] <command...>"
+    interactive=1
+    title "register a project"
+  fi
+
+  if ((interactive)); then
+    until [[ -n $id ]] && valid_id "$id"; do ask id "Project ID" "$id"; done
+    until [[ -n $port ]] && valid_port "$port"; do ask port "Port" "$port"; done
+    [[ -n $dir ]] || ask dir "Directory" "$(tilde "$PWD")"
+    until [[ -n $cmd ]] && valid_cmd "$cmd"; do ask cmd "Command" "$cmd"; done
+    echo
+  else
+    valid_id "$id" && valid_port "$port" && valid_cmd "$cmd" || exit 1
+  fi
+
+  ensure_db
+  dir=${dir:-$PWD}; dir=${dir/#\~/$HOME}
+  if [[ -d $dir ]]; then dir=$(cd "$dir" && pwd -P)
+  else
+    warn "Directory $(tilde "$dir") does not exist (yet)."
+    ((force)) || confirm "Save anyway?" || die "Aborted."
+    [[ $dir == /* ]] || dir="$PWD/$dir"
+  fi
+
+  if load "$id" && ((!force)); then
+    warn "Project ${B}$id${N} already exists (port $P_PORT, ${P_CMD})."
+    confirm "Overwrite it?" || die "Aborted."
+  fi
+
+  local other; other=$(port_owner "$port" "$id")
+  if [[ -n $other ]] && ((!force)); then
+    warn "Port ${B}$port${N} is already registered to ${B}$other${N}."
+    confirm "Register it anyway?" || die "Aborted."
+  fi
+
+  save "$id" "$port" "$dir" "$cmd"
+  ok "Registered ${B}$id${N}"
+  kv port "$port"
+  kv dir "$(tilde "$dir")"
+  kv command "$cmd"
+  printf '\n   %sRun it with%s %sdelegpo %s%s\n\n' "$D" "$N" "$B" "$id" "$N"
+}
+
+cmd_edit() {
+  ensure_db
+  if [[ -z $1 ]]; then
+    "${EDITOR:-vi}" "$DB"; return
+  fi
+  require_project "$1"
+  [[ -t 0 ]] || die "edit needs an interactive terminal"
+  title "edit $P_ID  ${D}(enter keeps the current value)${N}"
+
+  local id port dir cmd
+  ask id "Project ID" "$P_ID";        until valid_id "$id"; do ask id "Project ID" "$P_ID"; done
+  ask port "Port" "$P_PORT";          until valid_port "$port"; do ask port "Port" "$P_PORT"; done
+  ask dir "Directory" "$(tilde "$P_DIR")"
+  ask cmd "Command" "$P_CMD";         until valid_cmd "$cmd"; do ask cmd "Command" "$P_CMD"; done
+  echo
+  dir=${dir/#\~/$HOME}
+
+  local old=$P_ID
+  if [[ $id != "$old" ]] && load "$id"; then
+    die "Another project is already named ${B}$id${N}."
+  fi
+  local other; other=$(port_owner "$port" "$old")
+  if [[ -n $other ]]; then
+    warn "Port ${B}$port${N} is also registered to ${B}$other${N}."
+    confirm "Keep it anyway?" || die "Aborted."
+  fi
+
+  [[ $id != "$old" ]] && delete "$old"
+  save "$id" "$port" "$dir" "$cmd"
+  ok "Updated ${B}$id${N}"
+  echo
+}
+
+cmd_rm() {
+  ensure_db
+  local force=0 id=""
+  for a in "$@"; do case $a in -f | --force) force=1 ;; *) id=$a ;; esac; done
+  require_project "$id"
+  ((force)) || confirm "Remove ${B}$P_ID${N} (port $P_PORT)?" || die "Aborted."
+  delete "$P_ID"
+  ok "Removed ${B}$P_ID${N}"
+}
+
+cmd_ls() {
+  ensure_db
+  local ids=() ports=() dirs=() cmds=() id port dir cmd
+  while IFS=$'\t' read -r id port dir cmd; do
+    [[ -z $id || $id == \#* ]] && continue
+    ids+=("$id"); ports+=("$port"); dirs+=("$dir"); cmds+=("$cmd")
+  done <"$DB"
+
+  title "projects"
+  if ((${#ids[@]} == 0)); then
+    printf '   %sNo projects registered yet.%s\n' "$D" "$N"
+    printf '   Add one with %sdelegpo add <id> <port> <command>%s\n\n' "$B" "$N"
+    return
+  fi
+
+  local live; live=$(listening)
+  local i n=${#ids[@]} procs=() states=() live_count=0
+  local wid=2 wproc=7 wdir=3
+  for ((i = 0; i < n; i++)); do
+    local l; l=$(listeners_on "${ports[i]}" "$live")
+    if [[ -n $l ]]; then
+      states[i]=live; ((live_count++))
+      procs[i]=$(awk '{ printf "%s%s:%s", (NR > 1 ? "," : ""), $2, $1 }' <<<"$l")
+    else
+      states[i]=idle; procs[i]=""
+    fi
+    ((${#ids[i]} > wid)) && wid=${#ids[i]}
+    ((${#procs[i]} > wproc)) && wproc=${#procs[i]}
+    dirs[i]=$(tilde "${dirs[i]}")
+    ((${#dirs[i]} > wdir)) && wdir=${#dirs[i]}
+  done
+  ((wproc > 22)) && wproc=22
+  ((wdir > 32)) && wdir=32
+  local wport=5 wst=6
+  local wcmd=$(($(term_cols) - 3 - wid - wport - wst - wproc - wdir - 10))
+  # Give the command column room first by shrinking DIR (down to 12 chars).
+  while ((wcmd < 24 && wdir > 12)); do ((wdir--, wcmd++)); done
+  ((wcmd < 12)) && wcmd=12
+
+  printf "   ${D}%-*s  %-*s  %-*s  %-*s  %-*s  %s${N}\n" \
+    "$wid" ID "$wport" PORT "$wst" STATUS "$wproc" PROCESS "$wdir" DIR COMMAND
+  printf "   ${D}%s${N}\n" "$(rule $((wid + wport + wst + wproc + wdir + wcmd + 10)))"
+
+  for ((i = 0; i < n; i++)); do
+    local dot="${D}○${N}" word="idle" pc="$D"
+    [[ ${states[i]} == live ]] && dot="${G}●${N}" word="live" pc=""
+    printf "   ${B}%-*s${N}  %-*s  %s %-4s  ${pc}%-*s${N}  ${D}%-*s${N}  %s\n" \
+      "$wid" "${ids[i]}" "$wport" "${ports[i]}" "$dot" "$word" \
+      "$wproc" "$(trunc "${procs[i]:--}" "$wproc")" \
+      "$wdir" "$(trunc "${dirs[i]}" "$wdir")" \
+      "$(trunc "${cmds[i]}" "$wcmd")"
+  done
+  printf '\n   %s%d project(s) · %s%d live%s\n\n' "$D" "$n" "$G" "$live_count" "$N"
+}
+
+cmd_info() {
+  ensure_db
+  require_project "$1"
+  local l; l=$(listeners_on "$P_PORT")
+  title "$P_ID"
+  if [[ -n $l ]]; then kv status "${G}● live${N}  $(describe_listeners "$l")"
+  else kv status "${D}○ idle${N}"; fi
+  kv port "$P_PORT"
+  kv dir "$(tilde "$P_DIR")"
+  kv command "$P_CMD"
+  [[ -f $LOG_DIR/$P_ID.log ]] && kv log "$(tilde "$LOG_DIR/$P_ID.log")"
+  echo
+}
+
+cmd_status() {
+  ensure_db
+  local live; live=$(listening)
+  title "port monitor"
+
+  # Registered projects
+  local id port dir cmd active="" registered_ports=" "
+  while IFS=$'\t' read -r id port dir cmd; do
+    [[ -z $id || $id == \#* ]] && continue
+    registered_ports+="$port "
+    local l; l=$(listeners_on "$port" "$live")
+    [[ -n $l ]] && active+=$(printf '   %s●%s %s%-16s%s %s:%-6s%s %s\n' \
+      "$G" "$N" "$B" "$id" "$N" "$C" "$port" "$N" "$(describe_listeners "$l")")$'\n'
+  done <"$DB"
+
+  section "ACTIVE PROJECTS"
+  if [[ -n $active ]]; then printf '%s' "$active"
+  else printf '   %sNone of your projects are running.%s\n' "$D" "$N"; fi
+  echo
+
+  # Everything else holding a port
+  section "OTHER OCCUPIED PORTS"
+  local p pid proc any=0 last=""
+  while read -r p pid proc; do
+    [[ -z $p ]] && continue
+    [[ $registered_ports == *" $p "* ]] && continue
+    any=1
+    if [[ $p == "$last" ]]; then printf '     %s%-6s%s %s (pid %s)\n' "$D" "" "$N" "$proc" "$pid"
+    else printf '     %s:%-6s%s %s %s(pid %s)%s\n' "$C" "$p" "$N" "$proc" "$D" "$pid" "$N"; fi
+    last=$p
+  done <<<"$live"
+  ((any)) || printf '   %sNothing else is listening.%s\n' "$D" "$N"
+  echo
+}
+
+cmd_run() {
+  local id="" detach=0
+  for a in "$@"; do case $a in -d | --detach) detach=1 ;; *) id=$a ;; esac; done
+  ensure_db
+  require_project "$id"
+
+  local l; l=$(listeners_on "$P_PORT")
+  if [[ -n $l ]]; then
+    warn "Port ${B}$P_PORT${N} is already in use by $(describe_listeners "$l")"
+    [[ -t 0 ]] || die "Aborted (port busy)."
+    printf '   %s[k]%s kill it and continue   %s[r]%s run anyway   %s[a]%s abort %s(default)%s: ' \
+      "$B" "$N" "$B" "$N" "$B" "$N" "$D" "$N"
+    local choice; IFS= read -r choice
+    case $choice in
+      k | K) stop_port "$P_PORT" 0 || die "Could not free port $P_PORT." ;;
+      r | R) ;;
+      *) die "Aborted." ;;
+    esac
+  fi
+
+  [[ -d $P_DIR ]] || die "Directory not found: $(tilde "$P_DIR")"
+
+  title "launching $P_ID"
+  kv port "$P_PORT"
+  kv dir "$(tilde "$P_DIR")"
+  kv command "$P_CMD"
+
+  cd "$P_DIR" || die "Cannot cd into $P_DIR"
+  export PORT="$P_PORT" DELEGPO_ID="$P_ID"
+
+  if ((detach)); then
+    local log="$LOG_DIR/$P_ID.log"
+    printf '\n── %s · delegpo run %s (port %s) ──\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$P_ID" "$P_PORT" >>"$log"
+    nohup "$RUN_SHELL" -c "$P_CMD" >>"$log" 2>&1 </dev/null &
+    local pid=$!
+    disown 2>/dev/null
+    echo
+    ok "Started in background ${D}(pid $pid)${N}"
+    printf '   %sLogs:%s delegpo logs %s   %sStop:%s delegpo stop %s\n\n' "$D" "$N" "$P_ID" "$D" "$N" "$P_ID"
+  else
+    printf '   %s%s%s\n\n' "$D" "$(rule 40)" "$N"
+    exec "$RUN_SHELL" -c "$P_CMD"
+  fi
+}
+
+stop_port() { # stop_port PORT FORCE → 0 when the port is free afterwards
+  local port=$1 force=$2 pids i
+  pids=$(listeners_on "$port" | awk '{ print $1 }' | sort -u)
+  [[ -n $pids ]] || return 0
+  # shellcheck disable=SC2086
+  kill $( ((force)) && echo -9 || echo -TERM) $pids 2>/dev/null
+  for ((i = 0; i < 25; i++)); do
+    [[ -z $(listeners_on "$port") ]] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+cmd_stop() {
+  local id="" force=0
+  for a in "$@"; do case $a in -f | --force) force=1 ;; *) id=$a ;; esac; done
+  ensure_db
+  require_project "$id"
+  local l; l=$(listeners_on "$P_PORT")
+  [[ -n $l ]] || { info "${B}$P_ID${N} is not running (port $P_PORT is free)."; return 0; }
+  info "Stopping $(describe_listeners "$l") on port ${B}$P_PORT${N}..."
+  if stop_port "$P_PORT" "$force"; then
+    ok "Stopped ${B}$P_ID${N}"
+  else
+    die "Still listening on $P_PORT. Try ${B}delegpo stop $P_ID -f${N}"
+  fi
+}
+
+cmd_logs() {
+  ensure_db
+  require_project "$1"
+  local log="$LOG_DIR/$P_ID.log"
+  [[ -f $log ]] || die "No logs for ${B}$P_ID${N} yet (logs exist only for runs started with -d)."
+  info "Following $(tilde "$log") ${D}(Ctrl-C to quit)${N}"
+  tail -n 50 -f "$log"
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+main() {
+  local sub=${1-}
+  (($#)) && shift
+  case $sub in
+    "") ensure_db; if [[ -s $DB ]]; then cmd_ls; else cmd_help; fi ;;
+    add | register | new) cmd_add "$@" ;;
+    edit) cmd_edit "$@" ;;
+    rm | remove | del) cmd_rm "$@" ;;
+    ls | list) cmd_ls ;;
+    info | show) cmd_info "$@" ;;
+    status | ps) cmd_status ;;
+    stop | kill) cmd_stop "$@" ;;
+    logs) cmd_logs "$@" ;;
+    run) cmd_run "$@" ;;
+    help | -h | --help) cmd_help ;;
+    version | -v | --version) echo "delegpo $VERSION" ;;
+    -*) die "Unknown option: $sub" ;;
+    *) cmd_run "$sub" "$@" ;;
+  esac
+}
+
+main "$@"
