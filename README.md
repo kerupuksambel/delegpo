@@ -22,17 +22,72 @@ shows you what is running.
 
 ## Installation
 
+delegpo is a single script. To call it as `delegpo` from any directory, copy it
+into a `bin` folder that is on your `$PATH`.
+
+### 1. Get the script
+
 ```sh
 git clone git@github.com:kerupuksambel/delegpo.git
 cd delegpo
-chmod +x delegpo
-ln -s "$PWD/delegpo" /usr/local/bin/delegpo   # or any directory on your $PATH, e.g. ~/.local/bin
 ```
 
-Check it works:
+### 2. Copy it into a bin folder
+
+**System-wide** (needs `sudo`):
 
 ```sh
+sudo cp delegpo /usr/local/bin/delegpo
+sudo chmod +x /usr/local/bin/delegpo
+```
+
+> On macOS, use `/usr/local/bin`, not `/usr/bin`: `/usr/bin` is protected by
+> System Integrity Protection and is read-only even with `sudo`. On Linux,
+> `/usr/local/bin` is also the right place for tools you install yourself.
+
+**Just for your user** (no `sudo`):
+
+```sh
+mkdir -p ~/.local/bin
+cp delegpo ~/.local/bin/delegpo
+chmod +x ~/.local/bin/delegpo
+```
+
+If `~/.local/bin` is not on your `$PATH` yet, add it to your shell config and
+reload it:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc for Bash
+source ~/.zshrc
+```
+
+### 3. Run it from anywhere
+
+```sh
+which delegpo     # should print /usr/local/bin/delegpo or ~/.local/bin/delegpo
 delegpo help
+```
+
+If your shell still says `command not found`, open a new terminal or run
+`hash -r` so it picks up the new command.
+
+### Updating
+
+Pull the latest version and copy it over the old one:
+
+```sh
+cd delegpo && git pull
+sudo cp delegpo /usr/local/bin/delegpo        # or: cp delegpo ~/.local/bin/delegpo
+```
+
+> **Tip:** if you'd rather have `git pull` update it automatically, symlink
+> instead of copying: `ln -s "$PWD/delegpo" /usr/local/bin/delegpo`.
+
+### Uninstalling
+
+```sh
+sudo rm /usr/local/bin/delegpo     # or: rm ~/.local/bin/delegpo
+rm -r ~/.config/delegpo            # optional: also delete your registered projects and logs
 ```
 
 ## Quick start
